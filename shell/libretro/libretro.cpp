@@ -22,6 +22,13 @@
 #include <sys/time.h>
 #endif
 #include <mutex>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <fcntl.h>
+#include <unistd.h>
+#include <chrono>
+#include <condition_variable>
+#include <thread>
+#endif
 
 #ifdef __SWITCH__
 #include <stdlib.h>
@@ -171,6 +178,128 @@ s32 mo_y_abs[4];
 static u32 vib_stop_time[4];
 static double vib_strength[4];
 static double vib_delta[4];
+
+#if defined(__linux__) && !defined(__ANDROID__)
+// Vibration motor of the rk3326 handhelds (R36S and clones), driven by the core
+// like the ArkOS flycast rumble patch does, with the same sysfs files and values,
+// but written from a small thread instead of a shell on the emulation thread.
+struct pwm_motor_t
+{
+	const char *path;
+	const char *on;
+	const char *off;
+};
+static const pwm_motor_t pwm_motors[] = {
+	{ "/sys/class/pwm/pwmchip0/pwm0/duty_cycle", "10", "1000000" },
+	{ "/sys/class/pwm/pwmchip1/pwm0/enable",     "0",  "1" },
+};
+#define PWM_MIN_PULSE_MS 400
+
+static const pwm_motor_t *pwm_motor;
+static int pwm_fd = -1;    // not writable by this user: fall back to sudo tee
+static bool pwm_probed;
+static bool pwm_want;
+static bool pwm_quit;
+static std::chrono::steady_clock::time_point pwm_off_at;
+static std::mutex pwm_mutex;
+static std::condition_variable pwm_cv;
+static std::thread pwm_thread;
+
+static void pwm_write(bool on)
+{
+	const char *value = on ? pwm_motor->on : pwm_motor->off;
+	if (pwm_fd >= 0)
+	{
+		if (pwrite(pwm_fd, value, strlen(value), 0) < 0)
+			WARN_LOG(INPUT, "rumble: cannot write %s", pwm_motor->path);
+	}
+	else
+	{
+		char cmd[128];
+		snprintf(cmd, sizeof(cmd), "echo %s | sudo tee %s > /dev/null", value, pwm_motor->path);
+		if (system(cmd) != 0)
+			WARN_LOG(INPUT, "rumble: '%s' failed", cmd);
+	}
+}
+
+static void pwm_worker()
+{
+	bool motor = false;
+	std::unique_lock<std::mutex> lock(pwm_mutex);
+	while (true)
+	{
+		if (pwm_want && std::chrono::steady_clock::now() >= pwm_off_at)
+			pwm_want = false;
+		bool want = pwm_want && !pwm_quit;
+		if (want != motor)
+		{
+			motor = want;
+			lock.unlock();
+			pwm_write(motor);
+			lock.lock();
+			continue;
+		}
+		if (pwm_quit)
+			break;
+		if (motor)
+			pwm_cv.wait_until(lock, pwm_off_at);
+		else
+			pwm_cv.wait(lock);
+	}
+}
+
+// Motor on for at least PWM_MIN_PULSE_MS (a shorter pulse is not felt), or off.
+static void pwm_rumble(bool on, u32 duration_ms)
+{
+	if (!pwm_probed)
+	{
+		pwm_probed = true;
+		for (const pwm_motor_t &m : pwm_motors)
+		{
+			if (access(m.path, F_OK) != 0)
+				continue;
+			pwm_motor = &m;
+			pwm_fd = open(m.path, O_WRONLY | O_CLOEXEC);
+			pwm_quit = false;
+			pwm_want = false;
+			pwm_thread = std::thread(pwm_worker);
+			INFO_LOG(INPUT, "rumble: motor %s%s", m.path, pwm_fd < 0 ? " (through sudo)" : "");
+			break;
+		}
+	}
+	if (pwm_motor == nullptr)
+		return;
+	{
+		std::lock_guard<std::mutex> lock(pwm_mutex);
+		pwm_want = on;
+		if (on)
+			pwm_off_at = std::chrono::steady_clock::now()
+				+ std::chrono::milliseconds(std::max<u32>(duration_ms, PWM_MIN_PULSE_MS));
+	}
+	pwm_cv.notify_one();
+}
+
+static void pwm_rumble_term()
+{
+	if (pwm_thread.joinable())
+	{
+		{
+			std::lock_guard<std::mutex> lock(pwm_mutex);
+			pwm_quit = true;
+		}
+		pwm_cv.notify_one();
+		pwm_thread.join();
+	}
+	if (pwm_fd >= 0)
+		close(pwm_fd);
+	pwm_fd = -1;
+	pwm_motor = nullptr;
+	pwm_probed = false;
+}
+#else
+static void pwm_rumble(bool on, u32 duration_ms) {}
+static void pwm_rumble_term() {}
+#endif
 
 unsigned per_content_vmus = 0;
 
@@ -433,6 +562,7 @@ void retro_deinit()
 	{
 		std::lock_guard<std::mutex> lock(mtx_serialization);
 	}
+	pwm_rumble_term();
 	os_UninstallFaultHandler();
 	
 #if defined(__APPLE__) || (defined(__GNUC__) && defined(__linux__) && !defined(__ANDROID__))
@@ -2443,6 +2573,7 @@ void retro_unload_game()
 	disk_paths.clear();
 	disk_labels.clear();
 	blankVmus();
+	pwm_rumble_term();
 }
 
 
@@ -2557,7 +2688,7 @@ const char* retro_get_system_directory()
 
 void retro_get_system_info(struct retro_system_info *info)
 {
-   info->library_name = "Flycast";
+   info->library_name = "Flycast32 Modern";
 #ifndef GIT_VERSION
 #define GIT_VERSION "undefined"
 #endif
@@ -2667,6 +2798,7 @@ static void refresh_devices(bool first_startup)
       if (settings.platform.isConsole())
          maple_ReconnectDevices();
 
+      pwm_rumble(false, 0);
       if (rumble.set_rumble_state)
       {
          for(int i = 0; i < MAPLE_PORTS; i++)
@@ -3580,6 +3712,8 @@ void os_UpdateInputState()
 
 static void updateVibration(u32 port, float power, float inclination, u32 durationMs)
 {
+	if (port == 0)
+		pwm_rumble(power > 0, durationMs);
 	if (!rumble.set_rumble_state)
 		return;
 
